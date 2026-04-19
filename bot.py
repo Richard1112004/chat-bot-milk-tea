@@ -6,14 +6,23 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 import pandas as pd
+# Try new google.genai first, fall back to deprecated google.generativeai
+genai_version = None
+genai = None
 try:
-    import google.genai as genai
+    import google.genai
+    from google.genai import types
+    genai = google.genai
+    genai_version = "new"
 except Exception:
     try:
-        import google.generativeai as genai
-        logging.warning("google.generativeai is deprecated; install google.genai when available")
+        import google.generativeai
+        genai = google.generativeai
+        genai_version = "old"
+        logging.warning("google.generativeai is deprecated; please install google-genai when available")
     except Exception:
         genai = None
+        genai_version = None
         logging.warning("No Google GenAI client available; LLM calls will be disabled")
 import motor.motor_asyncio
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
@@ -31,7 +40,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
-    logger.info("python-dotenv not installed or .env not found; skipping .env load")
+    logger.info("python-dotenv not installed or no .env file; skipping .env load")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -45,21 +54,28 @@ if not TELEGRAM_TOKEN:
     logger.error("TELEGRAM_TOKEN not set in environment")
     raise SystemExit("TELEGRAM_TOKEN environment variable is required to start the bot. Set it in your environment or a .env file.")
 
-# Configure Gemini if client available
+# Configure genai client if available and GEMINI_API_KEY provided
+genai_client = None
 if genai is not None and GEMINI_API_KEY:
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
+        if genai_version == "new":
+            # New google.genai uses client-based API
+            genai_client = genai.Client(api_key=GEMINI_API_KEY)
+        else:
+            # Old google.generativeai uses configure
+            genai.configure(api_key=GEMINI_API_KEY)
     except Exception:
         logger.exception("Failed to configure genai client")
+        genai_client = None
 
-# Defer model initialization until after GEMINI_FUNCTIONS is defined. Start with None.
+# Defer model initialization until after GEMINI_FUNCTIONS is defined
 model = None
 
 # Global DB client (Motor) and collections
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI) if MONGODB_URI else None
-db = mongo_client.casso_milktea if mongo_client else None
-sessions_coll = db.sessions if db else None
-orders_coll = db.orders if db else None
+db = mongo_client.casso_milktea if mongo_client is not None else None
+sessions_coll = db.sessions if db is not None else None
+orders_coll = db.orders if db is not None else None
 
 # Load Menu.csv on startup using pandas and convert to a clean string for the system prompt
 MENU_CSV_PATH = "Menu.csv"
@@ -124,6 +140,19 @@ GEMINI_FUNCTIONS = [
         }
     }
 ]
+
+# Initialize model now that GEMINI_FUNCTIONS exists
+if genai is not None and GEMINI_API_KEY:
+    try:
+        if genai_version == "new":
+            # New google.genai uses client-based approach; store model name for later use
+            model = "gemini-3-flash-preview"
+        else:
+            # Old google.generativeai: use GenerativeModel directly
+            model = genai.GenerativeModel(model="gemini-3-flash-preview", tools=GEMINI_FUNCTIONS)
+    except Exception:
+        model = None
+        logger.info("Model initialization failed; will use fallback chat approach")
 
 
 def find_menu_row_by_id(item_id: str) -> Dict[str, Any]:
@@ -193,40 +222,116 @@ def calculate_and_checkout(items: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 async def call_gemini_with_history(history: List[Dict[str, str]]) -> Dict[str, Any]:
     """
-    Send chat history to Gemini. Prefer `GenerativeModel.start_chat` when available,
-    otherwise fall back to `genai.chat.create`.
+    Send chat history to Gemini using the appropriate API based on genai_version.
+    For the new google-genai SDK (2026+):
+    - Filters out 'system' role messages
+    - Maps 'assistant' role to 'model' role
+    - Transforms messages into types.Content objects
+    - Uses system_instruction and tools in the config
     """
-    def _call_with_model():
-        # start a chat with system instruction already included
-        chat = model.start_chat(system_instruction=SYSTEM_PROMPT)
-        # Send only the new user messages to the chat; history is a list of dicts
-        for m in history:
-            role = m.get('role', 'user')
-            content = m.get('content', '')
-            if role == 'user':
-                chat.send_message(content=content)
-        # Return the model's reply container
-        return chat.get_response()
+    def _call_with_old_api():
+        # Old google.generativeai API
+        if genai_version == "old" and isinstance(model, type(genai.GenerativeModel)):
+            chat = model.start_chat(system_instruction=SYSTEM_PROMPT)
+            for m in history:
+                role = m.get('role', 'user')
+                content = m.get('content', '')
+                if role == 'user':
+                    chat.send_message(content=content)
+            return chat.get_response()
+        else:
+            # Fallback to genai.chat.create for old API
+            return genai.chat.create(
+                model="gemini-3-flash-preview",
+                messages=history,
+                tools=GEMINI_FUNCTIONS,
+                temperature=0.2,
+            )
 
-    def _call_fallback():
-        return genai.chat.create(
-            model="gemini-3-flash-preview",
-            messages=history,
-            functions=GEMINI_FUNCTIONS,
+    def _call_with_new_api():
+        """Call the new google-genai SDK with proper message transformation."""
+        if genai_client is None:
+            raise RuntimeError("genai_client not initialized")
+        
+        # Transform history: filter out system messages and map assistant -> model
+        transformed_contents = []
+        for msg in history:
+            role = msg.get('role', 'user')
+            content = msg.get('content', '')
+            
+            # Skip system messages - they go into system_instruction
+            if role == 'system':
+                continue
+            
+            # Map 'assistant' to 'model' for Gemini API
+            if role == 'assistant':
+                role = 'model'
+            
+            # Create types.Content with text wrapped in types.Part
+            msg_content = types.Content(
+                role=role,
+                parts=[types.Part.from_text(text=content)]
+            )
+            transformed_contents.append(msg_content)
+        
+        # Define tool with JSON schema format (compatible with new SDK)
+        calculate_checkout_tool = types.Tool(
+            function_declarations=[
+                types.FunctionDeclaration(
+                    name="calculate_and_checkout",
+                    description="Calculate exact total price and return a detailed bill and a mock payment link.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "items": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "item_id": {"type": "string"},
+                                        "size": {"type": "string"},
+                                        "quantity": {"type": "integer"},
+                                        "note": {"type": "string"}
+                                    },
+                                    "required": ["item_id", "size", "quantity"]
+                                }
+                            }
+                        },
+                        "required": ["items"]
+                    }
+                )
+            ]
+        )
+        
+        # Create config with system_instruction and tools
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            tools=[calculate_checkout_tool],
             temperature=0.2,
         )
+        
+        # Call the API
+        response = genai_client.models.generate_content(
+            model="gemini-3-flash-preview",
+            contents=transformed_contents,
+            config=config,
+        )
+        
+        return response
 
-    if model is not None:
-        return await asyncio.to_thread(_call_with_model)
+    if genai_version == "new" and genai_client is not None:
+        return await asyncio.to_thread(_call_with_new_api)
+    elif genai_version == "old" and genai is not None:
+        return await asyncio.to_thread(_call_with_old_api)
     else:
-        return await asyncio.to_thread(_call_fallback)
+        raise RuntimeError("No valid genai client available")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     # Initialize the session document in MongoDB for this chat_id
     try:
-        if sessions_coll:
+        if sessions_coll is not None:
             await sessions_coll.update_one(
                 {"telegram_id": chat_id},
                 {"$setOnInsert": {"telegram_id": chat_id, "chat_history": [{"role": "system", "content": SYSTEM_PROMPT}], "status": "ordering", "cart": []}},
@@ -244,7 +349,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Fetch or create session from MongoDB
     try:
-        session_doc = await sessions_coll.find_one({"telegram_id": chat_id}) if sessions_coll else None
+        session_doc = await sessions_coll.find_one({"telegram_id": chat_id}) if sessions_coll is not None else None
     except Exception:
         logger.exception("Failed to read session from MongoDB")
         session_doc = None
@@ -253,12 +358,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # initialize
         session_doc = {"telegram_id": chat_id, "chat_history": [{"role": "system", "content": SYSTEM_PROMPT}], "status": "ordering", "cart": []}
         try:
-            if sessions_coll:
+            if sessions_coll is not None:
                 await sessions_coll.insert_one(session_doc)
         except Exception:
             logger.exception("Failed to insert new session")
 
     status = session_doc.get('status', 'ordering')
+
+    # If we are awaiting location, treat text as delivery address (for users without GPS)
+    if status == "awaiting_location":
+        address = text
+        try:
+            await sessions_coll.update_one(
+                {"telegram_id": chat_id},
+                {"$set": {"address": address, "status": "awaiting_description"}}
+            )
+        except Exception:
+            logger.exception("Failed to save address to session")
+
+        await update.message.reply_text("Cảm ơn cháu! Cháu ghi chú thêm giúp cô số nhà, tên tòa nhà hoặc số tầng để shipper dễ tìm nha.")
+        return
 
     # If we are awaiting description, route to finalize flow
     if status == "awaiting_description":
@@ -281,15 +400,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Call Gemini
     try:
-        # Gemini expects messages in a particular schema. Our stored `chat_history` is a list
-        # of dicts with `role` and `content`. Convert to Gemini-friendly format here.
-        gemini_messages = []
-        for m in history:
-            role = m.get('role', 'user')
-            content = m.get('content', '')
-            gemini_messages.append({"role": role, "content": content})
-
-        resp = await call_gemini_with_history(gemini_messages)
+        resp = await call_gemini_with_history(history)
     except Exception as e:
         logger.exception("Gemini call failed")
         text_err = str(e)
@@ -298,70 +409,146 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         await update.message.reply_text("Xin lỗi, có lỗi khi kết nối LLM.")
         return
-    # Gemini response parsing: support multiple possible shapes
+    
+    # Parse response based on SDK version
     try:
-        # Primary candidate text
-        candidate = None
-        if isinstance(resp, dict):
-            # genai.chat.create often returns an object with 'candidates'
-            candidate = resp.get('candidates', [None])[0]
-        else:
-            candidate = getattr(resp, 'candidates', [None])[0]
+        if genai_version == "new":
+            # New google-genai SDK: use response.text and response.function_calls
+            
+            # Check for function calls first
+            if hasattr(resp, 'function_calls') and resp.function_calls:
+                func_call = resp.function_calls[0] if resp.function_calls else None
+                if func_call:
+                    func_name = func_call.name
+                    # Parse function arguments from the FunctionCall object
+                    func_args = {}
+                    if hasattr(func_call, 'args'):
+                        func_args = dict(func_call.args)
+                    
+                    if func_name == 'calculate_and_checkout':
+                        items = func_args.get('items', [])
+                        receipt_data = process_checkout(items)
 
-        # Try to detect a tool/function call
-        tool_call = None
-        if candidate:
-            # candidate may contain 'tool_call' or 'content'
-            tool_call = candidate.get('tool_call') if isinstance(candidate, dict) else None
+                        # Update session in MongoDB and request location
+                        try:
+                            await sessions_coll.update_one(
+                                {"telegram_id": chat_id},
+                                {"$set": {"cart": items, "total_price": receipt_data['total'], "status": "awaiting_location"}}
+                            )
+                            await sessions_coll.update_one(
+                                {"telegram_id": chat_id},
+                                {"$push": {"chat_history": {"role": "assistant", "content": receipt_data['receipt']}}}
+                            )
+                        except Exception:
+                            logger.exception("Failed to update session with cart/total")
 
-        if tool_call:
-            func_name = tool_call.get('name')
-            func_args = tool_call.get('arguments') or {}
-
-            if func_name == 'calculate_and_checkout':
-                items = func_args.get('items', [])
-                receipt_data = process_checkout(items)
-
-                # Update session in MongoDB and request location
-                try:
-                    await sessions_coll.update_one({"telegram_id": chat_id}, {"$set": {"cart": items, "total_price": receipt_data['total'], "status": "awaiting_location"}})
-                    await sessions_coll.update_one({"telegram_id": chat_id}, {"$push": {"chat_history": {"role": "assistant", "content": None, "function_call": {"name": func_name, "arguments": json.dumps(func_args)}}}})
-                    await sessions_coll.update_one({"telegram_id": chat_id}, {"$push": {"chat_history": {"role": "function", "name": func_name, "content": receipt_data['receipt']}}})
-                except Exception:
-                    logger.exception("Failed to update session with cart/total")
-
-                kb = ReplyKeyboardMarkup([[KeyboardButton(text="Chia sẻ vị trí", request_location=True)]], one_time_keyboard=True, resize_keyboard=True)
-                try:
-                    await update.message.reply_text(f"{receipt_data['receipt']}\n\nVui lòng chia sẻ vị trí giao hàng để cô gửi shipper nhé.", reply_markup=kb)
-                except Exception:
-                    logger.exception("Failed to send receipt or keyboard")
+                        kb = ReplyKeyboardMarkup(
+                            [[KeyboardButton(text="Chia sẻ vị trí", request_location=True)]],
+                            one_time_keyboard=True,
+                            resize_keyboard=True
+                        )
+                        try:
+                            await update.message.reply_text(
+                                f"{receipt_data['receipt']}\n\nVui lòng chia sẻ vị trí giao hàng để cô gửi shipper nhé.",
+                                reply_markup=kb
+                            )
+                        except Exception:
+                            logger.exception("Failed to send receipt or keyboard")
+                    else:
+                        await update.message.reply_text("Tool call requested unknown tool.")
             else:
-                await update.message.reply_text("Tool call requested unknown tool.")
-        else:
-            # No tool; send assistant text
-            assistant_text = None
-            if candidate:
-                if isinstance(candidate, dict):
-                    # candidate may have 'content' as text or list
-                    assistant_text = candidate.get('content') or candidate.get('message') or None
-                    if isinstance(assistant_text, list):
-                        # join if list of parts
-                        assistant_text = "\n".join([p.get('text') if isinstance(p, dict) else str(p) for p in assistant_text])
+                # No tool call; send assistant text
+                assistant_text = resp.text if hasattr(resp, 'text') else None
+                
+                if assistant_text:
+                    try:
+                        await sessions_coll.update_one(
+                            {"telegram_id": chat_id},
+                            {"$push": {"chat_history": {"role": "assistant", "content": assistant_text}}}
+                        )
+                    except Exception:
+                        logger.exception("Failed to append assistant reply to chat_history")
+                    await update.message.reply_text(assistant_text)
                 else:
-                    assistant_text = str(candidate)
-
-            if not assistant_text:
-                # fallback: try resp.get('content')
-                assistant_text = resp.get('output', {}).get('content', '') if isinstance(resp, dict) else None
-
-            if assistant_text:
-                try:
-                    await sessions_coll.update_one({"telegram_id": chat_id}, {"$push": {"chat_history": {"role": "assistant", "content": assistant_text}}})
-                except Exception:
-                    logger.exception("Failed to append assistant reply to chat_history")
-                await update.message.reply_text(assistant_text)
+                    await update.message.reply_text("Xin lỗi, không nhận được phản hồi từ model.")
+        else:
+            # Old google.generativeai SDK: parse legacy response format
+            candidate = None
+            if isinstance(resp, dict):
+                candidate = resp.get('candidates', [None])[0]
             else:
-                await update.message.reply_text("Xin lỗi, không nhận được phản hồi từ model.")
+                candidate = getattr(resp, 'candidates', [None])[0]
+
+            # Try to detect a tool/function call
+            tool_call = None
+            if candidate:
+                tool_call = candidate.get('tool_call') if isinstance(candidate, dict) else None
+
+            if tool_call:
+                func_name = tool_call.get('name')
+                func_args = tool_call.get('arguments') or {}
+
+                if func_name == 'calculate_and_checkout':
+                    items = func_args.get('items', [])
+                    receipt_data = process_checkout(items)
+
+                    # Update session in MongoDB and request location
+                    try:
+                        await sessions_coll.update_one(
+                            {"telegram_id": chat_id},
+                            {"$set": {"cart": items, "total_price": receipt_data['total'], "status": "awaiting_location"}}
+                        )
+                        await sessions_coll.update_one(
+                            {"telegram_id": chat_id},
+                            {"$push": {"chat_history": {"role": "assistant", "content": None, "function_call": {"name": func_name, "arguments": json.dumps(func_args)}}}}
+                        )
+                        await sessions_coll.update_one(
+                            {"telegram_id": chat_id},
+                            {"$push": {"chat_history": {"role": "function", "name": func_name, "content": receipt_data['receipt']}}}
+                        )
+                    except Exception:
+                        logger.exception("Failed to update session with cart/total")
+
+                    kb = ReplyKeyboardMarkup(
+                        [[KeyboardButton(text="Chia sẻ vị trí", request_location=True)]],
+                        one_time_keyboard=True,
+                        resize_keyboard=True
+                    )
+                    try:
+                        await update.message.reply_text(
+                            f"{receipt_data['receipt']}\n\nVui lòng chia sẻ vị trí giao hàng để cô gửi shipper nhé.",
+                            reply_markup=kb
+                        )
+                    except Exception:
+                        logger.exception("Failed to send receipt or keyboard")
+                else:
+                    await update.message.reply_text("Tool call requested unknown tool.")
+            else:
+                # No tool; send assistant text
+                assistant_text = None
+                if candidate:
+                    if isinstance(candidate, dict):
+                        assistant_text = candidate.get('content') or candidate.get('message') or None
+                        if isinstance(assistant_text, list):
+                            assistant_text = "\n".join([p.get('text') if isinstance(p, dict) else str(p) for p in assistant_text])
+                    else:
+                        assistant_text = str(candidate)
+
+                if not assistant_text:
+                    assistant_text = resp.get('output', {}).get('content', '') if isinstance(resp, dict) else None
+
+                if assistant_text:
+                    try:
+                        await sessions_coll.update_one(
+                            {"telegram_id": chat_id},
+                            {"$push": {"chat_history": {"role": "assistant", "content": assistant_text}}}
+                        )
+                    except Exception:
+                        logger.exception("Failed to append assistant reply to chat_history")
+                    await update.message.reply_text(assistant_text)
+                else:
+                    await update.message.reply_text("Xin lỗi, không nhận được phản hồi từ model.")
+                    
     except Exception:
         logger.exception("Failed to parse Gemini response")
         await update.message.reply_text("Xin lỗi, có lỗi khi xử lý phản hồi từ LLM.")
@@ -415,6 +602,7 @@ async def handle_description_text(update: Update, context: ContextTypes.DEFAULT_
     total_price = session_doc.get('total_price', 0.0)
     lat = session_doc.get('lat')
     lon = session_doc.get('lon')
+    address = session_doc.get('address')  # Address from text instead of GPS
 
     if not cart:
         await update.message.reply_text("Không tìm thấy giỏ hàng. Vui lòng đặt lại.")
@@ -426,6 +614,7 @@ async def handle_description_text(update: Update, context: ContextTypes.DEFAULT_
         "total_price": total_price,
         "lat": lat,
         "lon": lon,
+        "address": address,  # Include address if provided
         "description": description,
         "status": "unpaid",
         "created_at": datetime.utcnow(),
