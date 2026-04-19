@@ -3,15 +3,17 @@ import json
 import logging
 import asyncio
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
+import re
 # Try new google.genai first, fall back to deprecated google.generativeai
 genai_version = None
 genai = None
 try:
     import google.genai
     from google.genai import types
+    from google.genai import errors as genai_errors
     genai = google.genai
     genai_version = "new"
 except Exception:
@@ -24,6 +26,15 @@ except Exception:
         genai = None
         genai_version = None
         logging.warning("No Google GenAI client available; LLM calls will be disabled")
+
+# PayOS imports
+try:
+    from payos import PayOS; from payos.types import ItemData, CreatePaymentLinkRequest as PaymentData
+    payos_available = True
+except Exception:
+    payos_available = False
+    logging.warning("payos library not installed; payment functionality will be disabled")
+
 import motor.motor_asyncio
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
@@ -46,6 +57,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
 
+# PayOS configuration
+PAYOS_CLIENT_ID = os.getenv("PAYOS_CLIENT_ID")
+PAYOS_API_KEY = os.getenv("PAYOS_API_KEY")
+PAYOS_CHECKSUM_KEY = os.getenv("PAYOS_CHECKSUM_KEY")
+
 if not GEMINI_API_KEY:
     logger.warning("GEMINI_API_KEY not set in environment; LLM calls will likely fail")
 if not MONGODB_URI:
@@ -53,6 +69,21 @@ if not MONGODB_URI:
 if not TELEGRAM_TOKEN:
     logger.error("TELEGRAM_TOKEN not set in environment")
     raise SystemExit("TELEGRAM_TOKEN environment variable is required to start the bot. Set it in your environment or a .env file.")
+
+# Initialize PayOS client
+payos = None
+if payos_available and PAYOS_CLIENT_ID and PAYOS_API_KEY and PAYOS_CHECKSUM_KEY:
+    try:
+        payos = PayOS(client_id=PAYOS_CLIENT_ID, api_key=PAYOS_API_KEY, checksum_key=PAYOS_CHECKSUM_KEY)
+        logger.info("PayOS client initialized successfully")
+    except Exception:
+        logger.exception("Failed to initialize PayOS client")
+        payos = None
+else:
+    if not payos_available:
+        logger.warning("payos library not available; payment functionality disabled")
+    elif not all([PAYOS_CLIENT_ID, PAYOS_API_KEY, PAYOS_CHECKSUM_KEY]):
+        logger.warning("PayOS credentials not fully configured; payment functionality disabled")
 
 # Configure genai client if available and GEMINI_API_KEY provided
 genai_client = None
@@ -68,9 +99,17 @@ if genai is not None and GEMINI_API_KEY:
         logger.exception("Failed to configure genai client")
         genai_client = None
 
+# Free models fallback list for handling quota exhaustion (429 errors)
+FREE_MODELS = [
+    'gemini-3-flash-preview',
+    'gemini-3.1-flash-lite-preview',
+    'gemini-2.5-pro',
+    'gemini-2.5-flash'
+]
+
 # Defer model initialization until after GEMINI_FUNCTIONS is defined
 model = None
-
+model_name = None
 # Global DB client (Motor) and collections
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGODB_URI) if MONGODB_URI else None
 db = mongo_client.casso_milktea if mongo_client is not None else None
@@ -144,15 +183,61 @@ GEMINI_FUNCTIONS = [
 # Initialize model now that GEMINI_FUNCTIONS exists
 if genai is not None and GEMINI_API_KEY:
     try:
+        # Build preferred model list, allow override via env GEMINI_MODEL
+        preferred = []
+        env_model = os.getenv("GEMINI_MODEL")
+        if env_model:
+            preferred.append(env_model)
+            logger.info(f"Using GEMINI_MODEL env override: {env_model}")
+        preferred.extend(["gemini-2.0-flash", "gemini-1.5-flash", "gemini-pro", "gemini-pro-vision"])
+
+        available_models = []
+        model_name = None
+        
+        # Try to list available models
+        if genai_client is not None:
+            try:
+                logger.info("Attempting to list available Gemini models...")
+                models_resp = genai_client.models.list()
+                for m in models_resp:
+                    try:
+                        name = m.name if hasattr(m, 'name') else str(m)
+                        # Clean up model name format (e.g., "models/gemini-pro" -> "gemini-pro")
+                        if name.startswith("models/"):
+                            name = name.replace("models/", "")
+                        available_models.append(name)
+                        logger.info(f"  Available model: {name}")
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.info(f"Could not list models with new SDK: {e}")
+                available_models = []
+
+        # Choose first preferred that exists in available, else try first preferred
+        if available_models:
+            for p in preferred:
+                if p in available_models:
+                    model_name = p
+                    logger.info(f"Selected model from available: {model_name}")
+                    break
+        
+        # If still no match, use first preferred
+        if not model_name:
+            model_name = preferred[0] if preferred else "gemini-pro"
+            logger.info(f"Using fallback model: {model_name}")
+
         if genai_version == "new":
             # New google.genai uses client-based approach; store model name for later use
-            model = "gemini-3-flash-preview"
+            model = model_name
+            logger.info(f"Model initialized for new SDK: {model}")
         else:
             # Old google.generativeai: use GenerativeModel directly
-            model = genai.GenerativeModel(model="gemini-3-flash-preview", tools=GEMINI_FUNCTIONS)
+            model = genai.GenerativeModel(model=model_name, tools=GEMINI_FUNCTIONS)
+            logger.info(f"Model initialized for old SDK: {model_name}")
     except Exception:
+        logger.exception("Model initialization failed; will use fallback chat approach")
         model = None
-        logger.info("Model initialization failed; will use fallback chat approach")
+        model_name = None
 
 
 def find_menu_row_by_id(item_id: str) -> Dict[str, Any]:
@@ -223,38 +308,21 @@ def calculate_and_checkout(items: List[Dict[str, Any]]) -> Dict[str, Any]:
 async def call_gemini_with_history(history: List[Dict[str, str]]) -> Dict[str, Any]:
     """
     Send chat history to Gemini using the appropriate API based on genai_version.
+    Implements a fallback strategy for handling 429 RESOURCE_EXHAUSTED errors.
+    
     For the new google-genai SDK (2026+):
     - Filters out 'system' role messages
     - Maps 'assistant' role to 'model' role
     - Transforms messages into types.Content objects
     - Uses system_instruction and tools in the config
+    - Iterates through FREE_MODELS list on 429 errors
     """
-    def _call_with_old_api():
-        # Old google.generativeai API
-        if genai_version == "old" and isinstance(model, type(genai.GenerativeModel)):
-            chat = model.start_chat(system_instruction=SYSTEM_PROMPT)
-            for m in history:
-                role = m.get('role', 'user')
-                content = m.get('content', '')
-                if role == 'user':
-                    chat.send_message(content=content)
-            return chat.get_response()
-        else:
-            # Fallback to genai.chat.create for old API
-            return genai.chat.create(
-                model="gemini-3-flash-preview",
-                messages=history,
-                tools=GEMINI_FUNCTIONS,
-                temperature=0.2,
-            )
-
-    def _call_with_new_api():
-        """Call the new google-genai SDK with proper message transformation."""
-        if genai_client is None:
-            raise RuntimeError("genai_client not initialized")
-        
-        # Transform history: filter out system messages and map assistant -> model
-        transformed_contents = []
+    if genai_version != "new" or genai_client is None:
+        raise RuntimeError("call_gemini_with_history requires the new google-genai SDK")
+    
+    # Transform history: filter out system messages and map assistant -> model
+    def _transform_history():
+        transformed = []
         for msg in history:
             role = msg.get('role', 'user')
             content = msg.get('content', '')
@@ -272,10 +340,12 @@ async def call_gemini_with_history(history: List[Dict[str, str]]) -> Dict[str, A
                 role=role,
                 parts=[types.Part.from_text(text=content)]
             )
-            transformed_contents.append(msg_content)
-        
-        # Define tool with JSON schema format (compatible with new SDK)
-        calculate_checkout_tool = types.Tool(
+            transformed.append(msg_content)
+        return transformed
+    
+    # Define tool with JSON schema format (compatible with new SDK)
+    def _build_checkout_tool():
+        return types.Tool(
             function_declarations=[
                 types.FunctionDeclaration(
                     name="calculate_and_checkout",
@@ -302,29 +372,64 @@ async def call_gemini_with_history(history: List[Dict[str, str]]) -> Dict[str, A
                 )
             ]
         )
-        
-        # Create config with system_instruction and tools
-        config = types.GenerateContentConfig(
+    
+    # Create config with system_instruction and tools
+    def _build_config():
+        return types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
-            tools=[calculate_checkout_tool],
+            tools=[_build_checkout_tool()],
             temperature=0.2,
         )
-        
-        # Call the API
-        response = genai_client.models.generate_content(
-            model="gemini-3-flash-preview",
-            contents=transformed_contents,
-            config=config,
-        )
-        
-        return response
-
-    if genai_version == "new" and genai_client is not None:
-        return await asyncio.to_thread(_call_with_new_api)
-    elif genai_version == "old" and genai is not None:
-        return await asyncio.to_thread(_call_with_old_api)
-    else:
-        raise RuntimeError("No valid genai client available")
+    
+    # Iterate through FREE_MODELS for 429 handling
+    models_to_try = FREE_MODELS.copy()
+    last_error = None
+    
+    for model_name in models_to_try:
+        try:
+            logger.info(f"Attempting Gemini call with model: {model_name}")
+            
+            # Transform contents and build config for each attempt
+            transformed_contents = _transform_history()
+            config = _build_config()
+            
+            # Call the API
+            response = await asyncio.to_thread(
+                lambda: genai_client.models.generate_content(
+                    model=model_name,
+                    contents=transformed_contents,
+                    config=config,
+                )
+            )
+            
+            logger.info(f"Successfully received response from model: {model_name}")
+            return response
+            
+        except Exception as e:
+            last_error = e
+            
+            # Check if it's a ClientError with 429 status
+            if hasattr(e, '__class__') and e.__class__.__name__ == 'ClientError':
+                # Try to extract status code
+                error_code = getattr(e, 'status_code', None)
+                if error_code == 429:
+                    logger.warning(f"Model {model_name} exhausted, trying next...")
+                    continue
+            
+            # For other errors, also continue to try next model
+            logger.warning(f"Model {model_name} failed with error: {str(e)}")
+            continue
+    
+    # If all models in FREE_MODELS returned 429 or other errors
+    if last_error:
+        logger.error(f"All models exhausted. Last error: {str(last_error)}")
+        # Return a friendly Vietnamese message asking user to wait
+        return {
+            "error": True,
+            "message": "Cô chủ quán đang quá bận rộn. Vui lòng đợi cho đến khi hết giờ Pacific Time (nửa đêm) để thử lại. Xin lỗi vì sự bất tiện!"
+        }
+    
+    raise RuntimeError("No genai client available or no models to try")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -608,16 +713,105 @@ async def handle_description_text(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Không tìm thấy giỏ hàng. Vui lòng đặt lại.")
         return
 
+    # Generate unique order code using timestamp (integer, within JS safe integer range)
+    order_code_int = int(datetime.now().timestamp())
+    # Ensure order_code fits PayOS constraints (positive integer, <= 9007199254740991)
+    MAX_SAFE = 9007199254740991
+    if order_code_int <= 0:
+        order_code_int = abs(order_code_int) + 1
+    if order_code_int > MAX_SAFE:
+        order_code_int = order_code_int % MAX_SAFE or 1
+    # String form for human-visible messages
+    order_code = str(order_code_int)
+
+    # Convert total_price to integer (PayOS requirement - smallest currency unit)
+    # Assuming total_price is in VND and already a whole number; cast to int
+    amount = int(total_price)
+    
+    # Create ItemData list from cart
+    items_data = []
+    for cart_item in cart:
+        item_id = cart_item.get("item_id", "unknown")
+        size = cart_item.get("size", "M")
+        quantity = cart_item.get("quantity", 1)
+        note = cart_item.get("note", "")
+        
+        # Construct item name with details
+        item_name = f"{item_id} ({size}) x{quantity}"
+        if note:
+            item_name += f" - {note}"
+        
+        # Create ItemData; price can be 0 since we have amount in PaymentData
+        item_data = ItemData(
+            name=item_name,
+            quantity=quantity,
+            price=0  # Total amount is set in PaymentData
+        )
+        items_data.append(item_data)
+    
+    # Create payment data for PayOS
+    payment_data = None
+    checkout_url = None
+    
+    if payos is not None:
+        try:
+            # Use new PayOS API: payment_requests.create() instead of deprecated createPaymentLink()
+            # PayOS requires a short description (<=25 chars)
+            desc = f"Casso #{order_code}"
+            if len(desc) > 25:
+                desc = desc[:25]
+
+            payment_data = {
+                "orderCode": order_code_int,
+                "amount": amount,
+                "description": desc,
+                "items": [{"name": item.name, "quantity": item.quantity, "price": item.price} for item in items_data],
+                "cancelUrl": "https://google.com",
+                "returnUrl": "https://google.com",
+                "buyerName": "Casso Customer",
+                "buyerPhone": str(chat_id),
+                "buyerEmail": "noreply@casso.vn"
+            }
+            
+            # Create payment link using new API
+            result = payos.payment_requests.create(payment_data)
+            logger.info(f"PayOS response type: {type(result)}, response: {result}")
+            
+            # Try multiple ways to extract checkout URL
+            checkout_url = None
+            if isinstance(result, dict):
+                checkout_url = result.get("checkoutUrl") or result.get("checkout_url") or result.get("link")
+            else:
+                # Try object attributes
+                checkout_url = getattr(result, "checkoutUrl", None) or getattr(result, "checkout_url", None) or getattr(result, "link", None)
+            
+            if not checkout_url:
+                logger.warning(f"PayOS did not return checkout URL for order {order_code}. Full response: {result}")
+                checkout_url = None
+        except Exception as e:
+            logger.exception(f"Failed to create PayOS payment link for order {order_code}")
+            logger.error(f"Error details: {str(e)}, Type: {type(e)}")
+            checkout_url = None
+    else:
+        logger.warning("PayOS not available; using fallback payment link")
+    
+    # If PayOS failed or unavailable, use fallback
+    if not checkout_url:
+        checkout_url = "https://google.com"  # Fallback link
+    
+    # Create order document
     order_doc = {
         "telegram_id": chat_id,
+        "order_code": order_code_int,
         "items": cart,
         "total_price": total_price,
         "lat": lat,
         "lon": lon,
         "address": address,  # Include address if provided
         "description": description,
-        "status": "unpaid",
-        "created_at": datetime.utcnow(),
+        "status": "pending",  # Changed from 'unpaid' to 'pending'
+        "payment_link": checkout_url,
+        "created_at": datetime.now(timezone.utc),
     }
 
     try:
@@ -629,9 +823,16 @@ async def handle_description_text(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Lỗi khi lưu đơn. Vui lòng thử lại sau.")
         return
 
-    # Send final mock payment link and summary
-    payment_link = "https://payos.demo/123"
-    summary_lines = [f"Đơn hàng đã được ghi nhận. Tổng: {total_price:.2f} VND", f"Link thanh toán: {payment_link}"]
+    # Format total price with comma separator for Vietnamese currency
+    formatted_price = f"{int(total_price):,}".replace(",", ".")
+    
+    # Send final payment link and summary with Vietnamese persona
+    summary_lines = [
+        "Đơn hàng đã được ghi nhận! 🎉",
+        f"Tổng tiền: {formatted_price} VND",
+        f"\nLink thanh toán: {checkout_url}",
+        "\nCảm ơn cháu đã tin tưởng cô! 💕"
+    ]
     await update.message.reply_text("\n".join(summary_lines))
 
 
