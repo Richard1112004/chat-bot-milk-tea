@@ -101,8 +101,8 @@ if genai is not None and GEMINI_API_KEY:
 
 # Free models fallback list for handling quota exhaustion (429 errors)
 FREE_MODELS = [
-    'gemini-3-flash-preview',
     'gemini-3.1-flash-lite-preview',
+    'gemini-3-flash-preview',
     'gemini-2.5-pro',
     'gemini-2.5-flash'
 ]
