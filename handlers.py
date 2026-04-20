@@ -31,7 +31,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception:
         logger.exception("Failed to initialize session in MongoDB")
 
-    await update.message.reply_text("Chào bạn! Mình là Cô chủ quán. Mình có thể giúp gì cho bạn hôm nay? Bạn có thể hỏi về menu hoặc đặt trà nhé.")
+    await update.message.reply_text("Chào con! Cô là chủ quán. Cô có thể giúp gì cho con hôm nay? Con có thể hỏi về menu hoặc đặt trà nhé.")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
