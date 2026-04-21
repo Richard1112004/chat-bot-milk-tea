@@ -1,0 +1,24 @@
+# Casso Milk Tea Bot - Requirements
+
+# Core dependencies
+python-telegram-bot>=20.0
+google-genai>=0.3.0
+motor>=3.3.0
+pandas>=2.0.0
+python-dotenv>=1.0.0
+
+# PayOS integration
+payos-sdk>=1.0.0
+
+# FastAPI & Webhook
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.0.0
+
+# Optional: for production deployment
+gunicorn>=21.0.0
+
+# Optional: for development
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+httpx>=0.25.0  # For testing FastAPI endpoints
