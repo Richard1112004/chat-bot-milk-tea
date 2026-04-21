@@ -184,17 +184,20 @@ async def call_gemini_with_history(history: List[Dict[str, str]]) -> Dict[str, A
                     logger.warning(f"Model {model_name} exhausted, trying next...")
                     continue
             
+            # For 503 errors, don't try next model - raise immediately
+            if hasattr(e, '__class__') and e.__class__.__name__ == 'ServerError':
+                error_code = getattr(e, 'status_code', None)
+                if error_code == 503:
+                    logger.error(f"Server error (503) from model {model_name}: {str(e)}")
+                    raise
+            
             # For other errors, also continue to try next model
             logger.warning(f"Model {model_name} failed with error: {str(e)}")
             continue
     
-    # If all models in FREE_MODELS returned 429 or other errors
+    # If all models in FREE_MODELS returned 429 or other errors, raise the last error
     if last_error:
         logger.error(f"All models exhausted. Last error: {str(last_error)}")
-        # Return a friendly Vietnamese message asking user to wait
-        return {
-            "error": True,
-            "message": "Cô chủ quán đang quá bận rộn. Vui lòng đợi cho đến khi hết giờ Pacific Time (nửa đêm) để thử lại. Xin lỗi vì sự bất tiện!"
-        }
+        raise last_error
     
     raise RuntimeError("No genai client available or no models to try")

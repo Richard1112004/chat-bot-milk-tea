@@ -7,9 +7,19 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ContextTypes
 
 from config import (
-    genai_version, sessions_coll, orders_coll, payos, SYSTEM_PROMPT, logger
+    genai_version, sessions_coll, orders_coll, payos, SYSTEM_PROMPT, logger, genai
 )
 from services import call_gemini_with_history, process_checkout
+
+# Import Gemini error types for version-specific handling
+try:
+    from google.genai import errors as genai_errors
+    ClientError = genai_errors.ClientError
+    ServerError = genai_errors.ServerError
+except Exception:
+    # Fallback for old SDK or if imports fail
+    ClientError = None
+    ServerError = None
 
 try:
     from payos.types import ItemData
@@ -94,11 +104,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         resp = await call_gemini_with_history(history)
     except Exception as e:
-        logger.exception("Gemini call failed")
-        text_err = str(e)
-        if "429" in text_err or "ResourceExhausted" in text_err or "Resource exhausted" in text_err:
-            await update.message.reply_text("Cô đang bận xíu, cháu đợi 10 giây rồi nhắn lại nhé")
+        # Extract status code if available
+        status_code = getattr(e, 'status_code', None)
+        error_class_name = e.__class__.__name__
+        
+        logger.error(
+            f"Gemini API call failed: {error_class_name}, status_code={status_code}, message={str(e)}"
+        )
+        
+        # Handle 429 - Resource Exhausted / Rate Limit
+        if status_code == 429 or (ClientError and isinstance(e, ClientError) and "429" in str(e)):
+            logger.warning("Gemini API rate limit (429) exceeded - user quota exhausted")
+            await update.message.reply_text(
+                "Cô đang có việc bận, cháu vui lòng chờ tới ngày mai nhé"
+            )
             return
+        
+        # Handle 503 - Service Unavailable / Server Error
+        if status_code == 503 or (ServerError and isinstance(e, ServerError) and "503" in str(e)):
+            logger.warning("Gemini API service unavailable (503) - temporary server overload")
+            await update.message.reply_text(
+                "Cô đang có việc bận, cháu chờ 5p sau thử lại nhé"
+            )
+            return
+        
+        # Generic error fallback
+        logger.error(f"Unexpected Gemini error: {error_class_name}")
         await update.message.reply_text("Xin lỗi, có lỗi khi kết nối LLM.")
         return
     
